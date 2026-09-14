@@ -3,8 +3,7 @@
 
   const TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "America/Chicago";
   const BLOCK_SECONDS = 3600;
-  const BREAK_AFTER_CONTENT_SECONDS = [1200, 2400];
-  const DEFAULT_SPOT_SECONDS = 60;
+  const MIN_PROGRAM_SECONDS = 1200;
 
   function stationParts(date) {
     const parts = new Intl.DateTimeFormat("en-US", {
@@ -30,6 +29,11 @@
     return `${part.year}-${String(part.month).padStart(2,"0")}-${String(part.day).padStart(2,"0")}`;
   }
 
+  function mondayIndex(nowMs) {
+    const weekday = new Intl.DateTimeFormat("en-US",{timeZone:TIME_ZONE,weekday:"short"}).format(new Date(nowMs));
+    return ({Mon:0,Tue:1,Wed:2,Thu:3,Fri:4,Sat:5,Sun:6})[weekday] ?? 0;
+  }
+
   function hash(text) {
     let value = 2166136261;
     for (let index = 0; index < text.length; index += 1) value = Math.imul(value ^ text.charCodeAt(index), 16777619);
@@ -37,6 +41,7 @@
   }
 
   function seededShuffle(items, seedText) {
+    if (root.InfinityChannelPolicy) return root.InfinityChannelPolicy.seededShuffle(items,seedText);
     const copy = items.slice();
     let seed = hash(seedText);
     const random = () => {
@@ -53,73 +58,67 @@
     return copy;
   }
 
-  function eligibleProgram(program) {
-    const runtime = Number(program && program.runtimeSeconds);
-    return Boolean(program && program.cleared && program.videoId && Number.isFinite(runtime) && runtime >= 1200);
+  function eligiblePrograms(catalog) {
+    if (root.InfinityChannelPolicy) return root.InfinityChannelPolicy.eligiblePrograms(catalog,{slotSeconds:BLOCK_SECONDS,minRuntimeSeconds:MIN_PROGRAM_SECONDS});
+    const seen=new Set();
+    return (Array.isArray(catalog)?catalog:[]).filter(program=>{
+      const runtime=Number(program&&program.runtimeSeconds);
+      if(!program||!program.cleared||!program.videoId||!Number.isFinite(runtime)||runtime<MIN_PROGRAM_SECONDS||seen.has(program.videoId))return false;
+      seen.add(program.videoId);return true;
+    });
   }
 
   function createDaySchedule(nowMs, catalog) {
     const part = stationParts(new Date(nowMs));
     const midnightMs = zonedToUtc(part.year, part.month, part.day);
-    const programs = (Array.isArray(catalog) ? catalog : []).filter(eligibleProgram);
-    if (!programs.length) throw new Error("No verified English-language Discovery programs are ready.");
+    const programs = eligiblePrograms(catalog);
     const todayKey = dateKey(nowMs);
-    const dayNumber = Math.floor(midnightMs / 86400000);
-    const cycle = seededShuffle(programs, `discovery-week-${Math.floor(dayNumber / 7)}`);
-    const start = ((dayNumber * 7) % cycle.length + cycle.length) % cycle.length;
-    return Array.from({length:24}, (_, index) => {
-      const movie = cycle[(start + index) % cycle.length];
-      const startsAtMs = midnightMs + index * BLOCK_SECONDS * 1000;
-      return {
-        id:`${todayKey}-${String(index).padStart(2,"0")}`,
-        movie, startsAtMs, endsAtMs:startsAtMs + BLOCK_SECONDS * 1000,
-        blockSeconds:BLOCK_SECONDS, fullStationSeconds:BLOCK_SECONDS
+    const dayOfDeck=mondayIndex(nowMs);
+    const epochDay=Math.floor(midnightMs/86400000);
+    const weekNumber=Math.floor((epochDay-dayOfDeck)/7);
+    const cycle=seededShuffle(programs,`discovery-seven-day-${weekNumber}:${programs.map(p=>p.videoId).sort().join("|")}`);
+    return Array.from({length:24},(_,index)=>{
+      const deckIndex=dayOfDeck*24+index;
+      const movie=cycle[deckIndex]||{
+        id:`DISCOVERY-FRESH-${todayKey}-${index}`,
+        title:"Fresh Discovery program source needed",
+        year:null,
+        collection:"Repeat blocked by seven-day scheduler",
+        runtimeSeconds:BLOCK_SECONDS,
+        videoId:"",
+        source:"Discovery catalog",
+        cleared:false,
+        refill:true,
+        posterUrl:""
       };
+      const startsAtMs=midnightMs+index*BLOCK_SECONDS*1000;
+      return{id:`${todayKey}-${String(index).padStart(2,"0")}`,movie,startsAtMs,endsAtMs:startsAtMs+BLOCK_SECONDS*1000,blockSeconds:BLOCK_SECONDS,fullStationSeconds:BLOCK_SECONDS};
     });
   }
 
+  function playableCommercials(commercials){return(Array.isArray(commercials)?commercials:[]).filter(ad=>ad&&ad.cleared&&ad.videoId&&Number(ad.durationSeconds||0)>0);}
+
   function createSegments(block, commercials) {
-    const runtime = Math.min(BLOCK_SECONDS, Math.max(1200, Math.floor(Number(block.movie.runtimeSeconds) || 3540)));
-    const breaks = BREAK_AFTER_CONTENT_SECONDS.filter(boundary => boundary < runtime - DEFAULT_SPOT_SECONDS);
-    const boundaries = [0, ...breaks, runtime];
-    const segments = [];
-    let stationStart = 0;
-    let adIndex = 0;
-    for (let index = 0; index < boundaries.length - 1; index += 1) {
-      const sourceStart = boundaries[index];
-      const duration = boundaries[index + 1] - sourceStart;
-      segments.push({kind:"movie", title:block.movie.title, videoId:block.movie.videoId, cleared:true, sourceStart, stationStart, duration});
-      stationStart += duration;
-      if (index < breaks.length && stationStart + DEFAULT_SPOT_SECONDS < BLOCK_SECONDS) {
-        const ad = commercials[adIndex++ % commercials.length] || {};
-        segments.push({kind:"commercial", title:ad.title || "Discovery intermission", videoId:ad.videoId || "", cleared:Boolean(ad.videoId && ad.cleared), sourceStart:0, stationStart, duration:DEFAULT_SPOT_SECONDS});
-        stationStart += DEFAULT_SPOT_SECONDS;
-      }
-    }
-    if (stationStart < BLOCK_SECONDS) {
-      segments.push({kind:"station", title:"Next program starts at the top of the hour", videoId:"", cleared:true, sourceStart:0, stationStart, duration:BLOCK_SECONDS - stationStart});
-    }
+    const runtime=Math.min(BLOCK_SECONDS,Math.max(1,Math.floor(Number(block.movie.runtimeSeconds)||BLOCK_SECONDS)));
+    const ads=playableCommercials(commercials);
+    const policy=root.InfinityChannelPolicy;
+    const breaks=ads.length&&runtime>=1800?(policy?policy.staggeredBreaks({channelId:"Discovery",blockId:block.id,dateKey:block.id.slice(0,10),runtimeSeconds:runtime,blockSeconds:BLOCK_SECONDS,count:runtime>=3000?2:1,edgeSeconds:420}):[]):[];
+    const boundaries=[0,...breaks.filter(n=>n>0&&n<runtime),runtime];
+    const segments=[];let stationStart=0,adIndex=0;
+    function push(segment,requested){const remaining=BLOCK_SECONDS-stationStart;if(remaining<=0)return false;const duration=Math.min(Math.max(1,Math.floor(requested)),remaining);segments.push({...segment,stationStart,duration});stationStart+=duration;return duration===requested;}
+    for(let index=0;index<boundaries.length-1;index+=1){const sourceStart=boundaries[index];if(!push({kind:"movie",title:block.movie.title,videoId:block.movie.videoId,cleared:!!block.movie.cleared,sourceStart},boundaries[index+1]-sourceStart))break;if(index<boundaries.length-2&&ads.length){const ad=ads[adIndex++%ads.length];push({kind:"commercial",title:ad.title||"Discovery intermission",videoId:ad.videoId,cleared:true,sourceStart:0},Math.min(90,Number(ad.durationSeconds)||30));}}
+    if(stationStart<BLOCK_SECONDS)push({kind:"station",title:block.movie.refill?"Fresh source required":"Next program starts at the top of the hour",videoId:"",cleared:true,sourceStart:0},BLOCK_SECONDS-stationStart);
     return segments;
   }
 
   function resolve(nowMs, schedule, commercials) {
-    const block = schedule.find(item => nowMs >= item.startsAtMs && nowMs < item.endsAtMs) || schedule[schedule.length - 1] || schedule[0];
-    const blockElapsed = Math.max(0, Math.min(BLOCK_SECONDS - 1, Math.floor((nowMs - block.startsAtMs) / 1000)));
-    const segments = createSegments(block, commercials);
-    const segment = segments.find(item => blockElapsed >= item.stationStart && blockElapsed < item.stationStart + item.duration) || segments[segments.length - 1];
-    const segmentElapsed = Math.max(0, blockElapsed - segment.stationStart);
-    return {
-      block, segment, segmentElapsed, blockElapsed,
-      mediaSeconds:segment.sourceStart + segmentElapsed,
-      segmentRemaining:Math.max(0, segment.duration - segmentElapsed),
-      movieReturnsIn:Math.max(0, segment.duration - segmentElapsed),
-      blockRemaining:Math.max(0, BLOCK_SECONDS - blockElapsed)
-    };
+    const block=schedule.find(item=>nowMs>=item.startsAtMs&&nowMs<item.endsAtMs)||schedule[schedule.length-1]||schedule[0];
+    const blockElapsed=Math.max(0,Math.min(BLOCK_SECONDS-1,Math.floor((nowMs-block.startsAtMs)/1000)));
+    const segments=createSegments(block,commercials);
+    const segment=segments.find(item=>blockElapsed>=item.stationStart&&blockElapsed<item.stationStart+item.duration)||segments[segments.length-1];
+    const segmentElapsed=Math.max(0,blockElapsed-segment.stationStart);
+    return{block,segment,segmentElapsed,blockElapsed,mediaSeconds:segment.sourceStart+segmentElapsed,segmentRemaining:Math.max(0,segment.duration-segmentElapsed),movieReturnsIn:Math.max(0,segment.duration-segmentElapsed),blockRemaining:Math.max(0,BLOCK_SECONDS-blockElapsed)};
   }
 
-  root.HermitEngine = {
-    TIME_ZONE, BLOCK_SECONDS, stationParts, zonedToUtc, dateKey,
-    stationDurationSeconds:() => BLOCK_SECONDS,
-    createDaySchedule, createSegments, resolve
-  };
+  root.HermitEngine={TIME_ZONE,BLOCK_SECONDS,stationParts,zonedToUtc,dateKey,mondayIndex,stationDurationSeconds:()=>BLOCK_SECONDS,createDaySchedule,createSegments,resolve};
 })(window);
