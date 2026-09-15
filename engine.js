@@ -77,18 +77,17 @@
     const epochDay=Math.floor(midnightMs/86400000);
     const weekNumber=Math.floor((epochDay-dayOfDeck)/7);
     const cycle=seededShuffle(programs,`discovery-seven-day-${weekNumber}:${programs.map(p=>p.videoId).sort().join("|")}`);
+    const dayOffset=cycle.length?(dayOfDeck*7)%cycle.length:0;
     return Array.from({length:24},(_,index)=>{
-      const deckIndex=dayOfDeck*24+index;
-      const movie=cycle[deckIndex]||{
-        id:`DISCOVERY-FRESH-${todayKey}-${index}`,
-        title:"Fresh Discovery program source needed",
+      const movie=cycle.length?cycle[(dayOffset+index)%cycle.length]:{
+        id:`DISCOVERY-EMPTY-${todayKey}-${index}`,
+        title:"Discovery program source unavailable",
         year:null,
-        collection:"Repeat blocked by seven-day scheduler",
+        collection:"No usable Discovery program exists in the catalog",
         runtimeSeconds:BLOCK_SECONDS,
         videoId:"",
         source:"Discovery catalog",
         cleared:false,
-        refill:true,
         posterUrl:""
       };
       const startsAtMs=midnightMs+index*BLOCK_SECONDS*1000;
@@ -107,7 +106,7 @@
     const segments=[];let stationStart=0,adIndex=0;
     function push(segment,requested){const remaining=BLOCK_SECONDS-stationStart;if(remaining<=0)return false;const duration=Math.min(Math.max(1,Math.floor(requested)),remaining);segments.push({...segment,stationStart,duration});stationStart+=duration;return duration===requested;}
     for(let index=0;index<boundaries.length-1;index+=1){const sourceStart=boundaries[index];if(!push({kind:"movie",title:block.movie.title,videoId:block.movie.videoId,cleared:!!block.movie.cleared,sourceStart},boundaries[index+1]-sourceStart))break;if(index<boundaries.length-2&&ads.length){const ad=ads[adIndex++%ads.length];push({kind:"commercial",title:ad.title||"Discovery intermission",videoId:ad.videoId,cleared:true,sourceStart:0},Math.min(90,Number(ad.durationSeconds)||30));}}
-    if(stationStart<BLOCK_SECONDS)push({kind:"station",title:block.movie.refill?"Fresh source required":"Next program starts at the top of the hour",videoId:"",cleared:true,sourceStart:0},BLOCK_SECONDS-stationStart);
+    if(stationStart<BLOCK_SECONDS)push({kind:"station",title:"Next program starts at the top of the hour",videoId:"",cleared:true,sourceStart:0},BLOCK_SECONDS-stationStart);
     return segments;
   }
 
